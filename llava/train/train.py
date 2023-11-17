@@ -15,27 +15,27 @@
 #    limitations under the License.
 
 import os
-import copy
+import copy, random, pickle
 from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
+import numpy as np
+from PIL import Image
 from typing import Dict, Optional, Sequence, List
 
 import torch
-
+from torchvision import transforms
 import transformers
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, QUESTION_LIST, QUESTION_LIST_BINARY 
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
+from llava.breast_datasets import load_single_image, CopyChannel
 from llava.mm_utils import tokenizer_image_token
-
-from PIL import Image
-
 
 local_rank = None
 
@@ -52,6 +52,7 @@ class ModelArguments:
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
     vision_tower: Optional[str] = field(default=None)
+    vision_delay_load: bool = field(default=True)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
     mm_projector_type: Optional[str] = field(default='linear')
@@ -62,11 +63,18 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
+    data_type: str = field(default='natural',
+                           metadata={"help": "whether to use natural images or mammo"})
     data_path: str = field(default=None,
                            metadata={"help": "Path to the training data."})
+    datalist_prefix : str = field(default=None,
+                           metadata={"help": "Prefix path to the training data."})
+    pos_to_neg_ratio: float = field(default = 1)
+    num_positives: int = field(default = 10000)
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
+    seg_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
 
 
@@ -104,6 +112,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    upsample: bool = field(default=False)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -623,6 +632,107 @@ def preprocess(
     return dict(input_ids=input_ids, labels=targets)
 
 
+
+class MammoSupervisedDataset1(Dataset):
+    def __init__(self, data_path: str,
+                 datalist_prefix: str,
+                 tokenizer: transformers.PreTrainedTokenizer,
+                 data_args: DataArguments):
+        super(MammoSupervisedDataset1, self).__init__()
+        with open(data_path, "rb") as f:
+            list_data_dict = pickle.load(f)
+
+        rank0_print("Formatting inputs...Skip in lazy mode")
+        self.tokenizer = tokenizer
+        self.list_data_dict = self.generate_convers(list_data_dict['train'])
+        self.data_args = data_args
+        self.image_pre_transformations = transforms.Compose([CopyChannel()])
+        self.datalist_prefix = datalist_prefix
+
+    def __len__(self):
+        return len(self.list_data_dict)
+
+    def generate_convers(self,list_data_dict):
+        #create conversation
+        new_data_list = []
+        for meta_data_pac in list_data_dict:
+            sources = [{'from': 'human', 'value': DEFAULT_IMAGE_TOKEN + '\n' + random.choice(QUESTION_LIST)},
+                    {'from': 'gpt',
+                    'value': 'True' if sum(meta_data_pac['ab_label'][:3]) > 0 else 'False'}]
+            meta_data_pac['conversations'] = sources
+            new_data_list.append(meta_data_pac) 
+        return new_data_list 
+
+    @property
+    def lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            img_tokens = 128 #if 'image' in sample else 0
+            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+        return length_list
+
+    @property
+    def modality_lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+            cur_len = cur_len #if 'images' in sample else -cur_len
+            length_list.append(cur_len)
+        return length_list
+    
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+             
+        meta_data_pac = self.list_data_dict[i]
+        sources = [meta_data_pac]
+        with open(os.path.join(self.datalist_prefix, meta_data_pac['pkl']), "rb") as f:
+            data = pickle.load(f)
+        data_pac = data[meta_data_pac['idx']]
+        
+        # load image
+        image_folder = self.data_args.image_folder
+        seg_folder = self.data_args.seg_folder
+        results = load_single_image(data_pac, image_folder, seg_folder, self.image_pre_transformations)      
+        image = results['image']
+        processor = self.data_args.image_processor
+        if self.data_args.image_aspect_ratio == 'pad':
+            def expand2square(pil_img, background_color):
+                width, height = pil_img.size
+                if width == height:
+                    return pil_img
+                elif width > height:
+                    result = Image.new(pil_img.mode, (width, width), background_color)
+                    result.paste(pil_img, (0, (width - height) // 2))
+                    return result
+                else:
+                    result = Image.new(pil_img.mode, (height, height), background_color)
+                    result.paste(pil_img, ((height - width) // 2, 0))
+                    return result
+            image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        else:
+            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        sources = preprocess_multimodal(
+            copy.deepcopy([e['conversations'] for e in sources]),
+            self.data_args)
+
+        data_dict = preprocess(
+            sources,
+            self.tokenizer,
+            has_image=True)
+        if isinstance(i, int):
+            data_dict = dict(input_ids=data_dict["input_ids"][0],
+                             labels=data_dict["labels"][0])
+
+        # image exist in the data
+        if 'pkl' in self.list_data_dict[i]:
+            data_dict['images'] = image
+        elif self.data_args.is_multimodal:
+            # image does not exist in the data, but the model is multimodal
+            crop_size = self.data_args.image_processor.crop_size
+            data_dict['images'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        return data_dict
+
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -744,14 +854,180 @@ class DataCollatorForSupervisedDataset(object):
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                data_path=data_args.data_path,
-                                data_args=data_args)
+    if data_args.data_type == 'mammo':
+        train_dataset = MammoSupervisedDataset(tokenizer=tokenizer,
+                                    data_path=data_args.data_path,
+                                    datalist_prefix=data_args.datalist_prefix,
+                                    data_args=data_args,
+                                    check_positive_func = check_positive_abnormality,
+                                    pos_to_neg_ratio=data_args.pos_to_neg_ratio,
+                                    num_positives=data_args.num_positives) 
+    else:
+        train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+                                    data_path=data_args.data_path,
+                                    data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
                 eval_dataset=None,
                 data_collator=data_collator)
 
+def check_positive_abnormality(x, label_idx=0):
+    label_list = x['ab_label'] 
+    ab_label = [1 if sum(label_list[:3])> 0 else 0, label_list[-1]]
+    if ab_label[label_idx] == 0:
+        return False
+    else:
+        return True
+
+def check_positive_random(x):
+    random_n = np.random.rand()
+    if random_n < 0.5:
+        return False
+    else:
+        return True
+
+class MammoSupervisedDataset(Dataset):
+    def __init__(self, data_path: str,
+                 datalist_prefix: str,
+                 tokenizer: transformers.PreTrainedTokenizer,
+                 data_args: DataArguments,
+                 check_positive_func: object,
+                 pos_to_neg_ratio: float,
+                 num_positives: int):
+        super(MammoSupervisedDataset, self).__init__()
+        with open(data_path, "rb") as f:
+            list_data_dict = pickle.load(f)
+
+        rank0_print("Formatting inputs...Skip in lazy mode")
+        self.tokenizer = tokenizer
+        self.list_data_dict = self.generate_convers(list_data_dict['train'])
+        self.data_args = data_args
+        self.image_pre_transformations = transforms.Compose([CopyChannel()])
+        self.datalist_prefix = datalist_prefix
+
+        self.pos_to_neg_ratio = pos_to_neg_ratio
+        self.check_positive_func = check_positive_func
+        self.num_positives = num_positives
+
+        self.positive_cases = [x for x in self.list_data_dict if self.check_positive_func(x)]
+        self.negative_cases = [x for x in self.list_data_dict if not self.check_positive_func(x)]
+        # Resample if requested
+        if self.pos_to_neg_ratio is not None:
+            self.resample()
+
+    def resample(self, pos_to_neg_ratio: float = None) -> Dict:
+        """
+        Resample self.list_data_dict to include all positive samples + some randomly sampled negative samples.
+        :param pos_to_neg_ratio:
+        :return:
+        """
+        # Determine how many negative samples do we need.
+        if pos_to_neg_ratio is None:
+            pos_to_neg_ratio = self.pos_to_neg_ratio
+        
+        if self.num_positives is not None: 
+            num_pos_cases = np.minimum(self.num_positives, len(self.positive_cases))
+            pos_random_idx = np.random.permutation(range(len(self.positive_cases)))[:num_pos_cases]
+            need_positive_cases = [self.positive_cases[idx] for idx in pos_random_idx]
+        else:
+            need_positive_cases = self.positive_cases 
+
+        neg_need_num = np.minimum(int(round(len(need_positive_cases) * pos_to_neg_ratio)), len(self.negative_cases))
+        neg_random_idx = np.random.permutation(range(len(self.negative_cases)))[:neg_need_num]
+        need_negative_cases = [self.negative_cases[idx] for idx in neg_random_idx]
+        self.list_data_dict = need_positive_cases + need_negative_cases
+        print('pos',pos_random_idx[:5])
+        print('neg',neg_random_idx[:5])
+        print("After upsampling: {} positive exams {} negative exams".format(len(need_positive_cases), len(need_negative_cases)))
+        # Reshuffle datalist.
+        np.random.shuffle(self.list_data_dict)
+
+    def __len__(self):
+        return len(self.list_data_dict)
+
+    def generate_convers(self,list_data_dict):
+        #create conversation
+        new_data_list = []
+        for meta_data_pac in list_data_dict:
+            sources = [{'from': 'human', 'value': DEFAULT_IMAGE_TOKEN + '\n' + random.choice(QUESTION_LIST)},
+                    {'from': 'gpt',
+                    'value': meta_data_pac['observation']}]
+            # sources = [{'from': 'human', 'value': DEFAULT_IMAGE_TOKEN + '\n' + random.choice(QUESTION_LIST_BINARY)},
+            #         {'from': 'gpt',
+            #          'value': 'True' if sum(meta_data_pac['ab_label'][:3]) > 0 else 'False'}]
+
+            meta_data_pac['conversations'] = sources
+            new_data_list.append(meta_data_pac) 
+        return new_data_list 
+
+    @property
+    def lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            img_tokens = 128 #if 'image' in sample else 0
+            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+        return length_list
+
+    @property
+    def modality_lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+            cur_len = cur_len #if 'images' in sample else -cur_len
+            length_list.append(cur_len)
+        return length_list
+    
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+             
+        meta_data_pac = self.list_data_dict[i]
+        sources = [meta_data_pac]
+        with open(os.path.join(self.datalist_prefix, meta_data_pac['pkl']), "rb") as f:
+            data = pickle.load(f)
+        data_pac = data[meta_data_pac['idx']]
+        
+        # load image
+        image_folder = self.data_args.image_folder
+        seg_folder = self.data_args.seg_folder
+        results = load_single_image(data_pac, image_folder, seg_folder, self.image_pre_transformations)      
+        image = results['image']
+        processor = self.data_args.image_processor
+        if self.data_args.image_aspect_ratio == 'pad':
+            def expand2square(pil_img, background_color):
+                width, height = pil_img.size
+                if width == height:
+                    return pil_img
+                elif width > height:
+                    result = Image.new(pil_img.mode, (width, width), background_color)
+                    result.paste(pil_img, (0, (width - height) // 2))
+                    return result
+                else:
+                    result = Image.new(pil_img.mode, (height, height), background_color)
+                    result.paste(pil_img, ((height - width) // 2, 0))
+                    return result
+            image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        else:
+            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        sources = preprocess_multimodal(
+            copy.deepcopy([e['conversations'] for e in sources]),
+            self.data_args)
+
+        data_dict = preprocess(
+            sources,
+            self.tokenizer,
+            has_image=True)
+        if isinstance(i, int):
+            data_dict = dict(input_ids=data_dict["input_ids"][0],
+                             labels=data_dict["labels"][0])
+
+        # image exist in the data
+        if 'pkl' in self.list_data_dict[i]:
+            data_dict['images'] = image
+        elif self.data_args.is_multimodal:
+            # image does not exist in the data, but the model is multimodal
+            crop_size = self.data_args.image_processor.crop_size
+            data_dict['images'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        return data_dict
 
 def train():
     global local_rank
@@ -921,9 +1197,11 @@ def train():
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
+                    upsample=training_args.upsample,
                     **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
