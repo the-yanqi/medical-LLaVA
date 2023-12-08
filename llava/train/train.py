@@ -22,11 +22,13 @@ import logging
 import pathlib
 import numpy as np
 from PIL import Image
-from typing import Dict, Optional, Sequence, List
+from typing import Dict, Optional, Sequence, List, Union
+from pathlib import Path
 
 import torch
 from torchvision import transforms
 import transformers
+from transformers.generation.configuration_utils import GenerationConfig
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, QUESTION_LIST, QUESTION_LIST_BINARY 
 from torch.utils.data import Dataset
@@ -36,9 +38,11 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.breast_datasets import load_single_image, CopyChannel
 from llava.mm_utils import tokenizer_image_token
+import nltk
+import evaluate
+
 
 local_rank = None
-
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -59,6 +63,7 @@ class ModelArguments:
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    mm_vision_train: bool = field(default=False)
 
 
 @dataclass
@@ -80,6 +85,7 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
+    output_dir: Optional[str] = field(default=None)
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
@@ -113,6 +119,33 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
     upsample: bool = field(default=False)
+    predict_with_generate: bool = field(
+        default=False, metadata={"help": "Whether to use generate to calculate generative metrics (ROUGE, BLEU)."}
+    )
+    generation_max_length: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "The `max_length` to use on each evaluation loop when `predict_with_generate=True`. Will default "
+                "to the `max_length` value of the model configuration."
+            )
+        },
+    )
+    generation_num_beams: Optional[int] = field(
+        default=1,
+        metadata={
+            "help": (
+                "The `num_beams` to use on each evaluation loop when `predict_with_generate=True`. Will default "
+                "to the `num_beams` value of the model configuration."
+            )
+        },
+    )
+    generation_config: Optional[Union[str, Path, GenerationConfig]] = field(
+        default=None,
+        metadata={
+            "help": "Model id, file path or url pointing to a GenerationConfig json file, to use during prediction."
+        },
+    )
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -631,108 +664,6 @@ def preprocess(
 
     return dict(input_ids=input_ids, labels=targets)
 
-
-
-class MammoSupervisedDataset1(Dataset):
-    def __init__(self, data_path: str,
-                 datalist_prefix: str,
-                 tokenizer: transformers.PreTrainedTokenizer,
-                 data_args: DataArguments):
-        super(MammoSupervisedDataset1, self).__init__()
-        with open(data_path, "rb") as f:
-            list_data_dict = pickle.load(f)
-
-        rank0_print("Formatting inputs...Skip in lazy mode")
-        self.tokenizer = tokenizer
-        self.list_data_dict = self.generate_convers(list_data_dict['train'])
-        self.data_args = data_args
-        self.image_pre_transformations = transforms.Compose([CopyChannel()])
-        self.datalist_prefix = datalist_prefix
-
-    def __len__(self):
-        return len(self.list_data_dict)
-
-    def generate_convers(self,list_data_dict):
-        #create conversation
-        new_data_list = []
-        for meta_data_pac in list_data_dict:
-            sources = [{'from': 'human', 'value': DEFAULT_IMAGE_TOKEN + '\n' + random.choice(QUESTION_LIST)},
-                    {'from': 'gpt',
-                    'value': 'True' if sum(meta_data_pac['ab_label'][:3]) > 0 else 'False'}]
-            meta_data_pac['conversations'] = sources
-            new_data_list.append(meta_data_pac) 
-        return new_data_list 
-
-    @property
-    def lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            img_tokens = 128 #if 'image' in sample else 0
-            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
-        return length_list
-
-    @property
-    def modality_lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
-            cur_len = cur_len #if 'images' in sample else -cur_len
-            length_list.append(cur_len)
-        return length_list
-    
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-             
-        meta_data_pac = self.list_data_dict[i]
-        sources = [meta_data_pac]
-        with open(os.path.join(self.datalist_prefix, meta_data_pac['pkl']), "rb") as f:
-            data = pickle.load(f)
-        data_pac = data[meta_data_pac['idx']]
-        
-        # load image
-        image_folder = self.data_args.image_folder
-        seg_folder = self.data_args.seg_folder
-        results = load_single_image(data_pac, image_folder, seg_folder, self.image_pre_transformations)      
-        image = results['image']
-        processor = self.data_args.image_processor
-        if self.data_args.image_aspect_ratio == 'pad':
-            def expand2square(pil_img, background_color):
-                width, height = pil_img.size
-                if width == height:
-                    return pil_img
-                elif width > height:
-                    result = Image.new(pil_img.mode, (width, width), background_color)
-                    result.paste(pil_img, (0, (width - height) // 2))
-                    return result
-                else:
-                    result = Image.new(pil_img.mode, (height, height), background_color)
-                    result.paste(pil_img, ((height - width) // 2, 0))
-                    return result
-            image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
-            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-        else:
-            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-        sources = preprocess_multimodal(
-            copy.deepcopy([e['conversations'] for e in sources]),
-            self.data_args)
-
-        data_dict = preprocess(
-            sources,
-            self.tokenizer,
-            has_image=True)
-        if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0],
-                             labels=data_dict["labels"][0])
-
-        # image exist in the data
-        if 'pkl' in self.list_data_dict[i]:
-            data_dict['images'] = image
-        elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
-            crop_size = self.data_args.image_processor.crop_size
-            data_dict['images'] = torch.zeros(3, crop_size['height'], crop_size['width'])
-        return data_dict
-
-
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -856,19 +787,29 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
     """Make dataset and collator for supervised fine-tuning."""
     if data_args.data_type == 'mammo':
         train_dataset = MammoSupervisedDataset(tokenizer=tokenizer,
+                                    mode='train',
                                     data_path=data_args.data_path,
                                     datalist_prefix=data_args.datalist_prefix,
                                     data_args=data_args,
                                     check_positive_func = check_positive_abnormality,
                                     pos_to_neg_ratio=data_args.pos_to_neg_ratio,
-                                    num_positives=data_args.num_positives) 
+                                    num_positives=data_args.num_positives)
+        val_dataset = MammoSupervisedDataset(tokenizer=tokenizer,
+                                    mode='val',
+                                    data_path=data_args.data_path,
+                                    datalist_prefix=data_args.datalist_prefix,
+                                    data_args=data_args,
+                                    check_positive_func = check_positive_abnormality,
+                                    pos_to_neg_ratio=None,
+                                    num_positives=None) 
     else:
         train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                     data_path=data_args.data_path,
                                     data_args=data_args)
+        val_dataset = None
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
-                eval_dataset=None,
+                eval_dataset=val_dataset,
                 data_collator=data_collator)
 
 def check_positive_abnormality(x, label_idx=0):
@@ -887,7 +828,8 @@ def check_positive_random(x):
         return True
 
 class MammoSupervisedDataset(Dataset):
-    def __init__(self, data_path: str,
+    def __init__(self, mode: str,
+                 data_path: str,
                  datalist_prefix: str,
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments,
@@ -900,7 +842,7 @@ class MammoSupervisedDataset(Dataset):
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
-        self.list_data_dict = self.generate_convers(list_data_dict['train'])
+        self.list_data_dict = self.generate_convers(list_data_dict[mode])
         self.data_args = data_args
         self.image_pre_transformations = transforms.Compose([CopyChannel()])
         self.datalist_prefix = datalist_prefix
@@ -1197,12 +1139,30 @@ def train():
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+    # TODO: Fix model.generate
+    def compute_metrics(pred):
+        logits = torch.from_numpy(pred.predictions)
+        labels = torch.from_numpy(pred.label_ids)
+        loss = F.cross_entropy(logits.view(-1, tokenizer.vocab_size), labels.view(-1))
+        return {'perplexity': math.exp(loss), 'calculated_loss': loss}
 
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     upsample=training_args.upsample,
+                    compute_metrics=None,
                     **data_module)
+
+    # eval_dataloader = trainer.get_eval_dataloader(data_module['eval_dataset'])
+    # for step, inputs in enumerate(eval_dataloader):
+    #     break
+    # inputs = trainer._prepare_inputs(inputs)
+    # #print(inputs['images'].shape)
+    # #print(inputs)
+    # model.encode_images(inputs['images'])
+    # generated_tokens = trainer.model.generate(**inputs, num_beams=1,synced_gpus=False)
+
+    # trainer.evaluate(data_module['eval_dataset'])
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
@@ -1226,6 +1186,7 @@ def train():
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
+
 
 
 if __name__ == "__main__":

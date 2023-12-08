@@ -13,6 +13,7 @@ class CLIPVisionTower(nn.Module):
         self.vision_tower_name = vision_tower
         self.select_layer = args.mm_vision_select_layer
         self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
+        self.vision_train = getattr(args, 'mm_vision_train', False)
         #self.delay_load = getattr(args, 'vision_delay_load', True)
 
         if not delay_load:
@@ -24,8 +25,8 @@ class CLIPVisionTower(nn.Module):
     def load_model(self):
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
         self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name)
-        self.vision_tower.requires_grad_(False)
-
+        if not self.vision_train:
+            self.vision_tower.requires_grad_(False)
         self.is_loaded = True
 
     def feature_select(self, image_forward_outs):

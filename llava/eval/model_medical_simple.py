@@ -1,13 +1,14 @@
 import argparse
 import torch
 import os
-import json
+import json, random
 from tqdm import tqdm
 import shortuuid
 import pickle
 
 from torchvision import transforms
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import QUESTION_LIST_NATURAL, QUESTION_LIST, QUESTION_LIST_BINARY
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
@@ -45,7 +46,15 @@ def eval_model(args):
     ans_file = open(answers_file, "w")
     for line in tqdm(questions[:1000]):
         idx = line["question_id"]
-        qs = "Can you describe what you see in the image?"#line["text"]
+        if args.question_type == 'natural':
+            qs = random.choice(QUESTION_LIST_NATURAL)
+        elif args.question_type == 'binary':
+            qs = random.choice(QUESTION_LIST_BINARY)
+        elif args.question_type == 'verbose':
+            side = 'right' if line['View'][0] == 'r' else 'left'
+            qs = random.choice(QUESTION_LIST).replace('xxx',side)
+        else:
+            qs = line["text"]
         cur_prompt = qs
         if model.config.mm_use_im_start_end:
             qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
@@ -76,7 +85,7 @@ def eval_model(args):
                 top_p=args.top_p,
                 num_beams=args.num_beams,
                 # no_repeat_ngram_size=3,
-                max_new_tokens=1024,
+                max_new_tokens=500,
                 use_cache=True)
 
         input_token_len = input_ids.shape[1]
@@ -106,6 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-folder", type=str, default="")
     parser.add_argument("--seg_folder", type=str, default="") 
     parser.add_argument("--question-file", type=str, default="tables/question.jsonl")
+    parser.add_argument("--question-type", type=str, default=None)
     parser.add_argument("--answers-file", type=str, default="answer.jsonl")
     parser.add_argument("--conv-mode", type=str, default="llava_v1")
     parser.add_argument("--num-chunks", type=int, default=1)
